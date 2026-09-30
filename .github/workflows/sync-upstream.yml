@@ -1,0 +1,52 @@
+name: Sync upstream source from czg86389-hub/muse2api
+
+# 上游：https://github.com/czg86389-hub/muse2api (MIT)。上游无 tag/release，故跟随默认分支 main 的
+# 最新提交同步进 upstream/，有变化则提交，并显式 dispatch build.yml 重新构建镜像。
+on:
+  schedule:
+    - cron: '7 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write   # 同步后显式 dispatch build.yml（workflow_dispatch 不受 GITHUB_TOKEN 触发限制）
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream (main)
+        run: |
+          set -euo pipefail
+          sha=$(curl -sSL https://api.github.com/repos/czg86389-hub/muse2api/commits/main \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['sha'])")
+          echo "upstream sha: $sha"
+          curl -sSL -o /tmp/u.tgz "https://github.com/czg86389-hub/muse2api/archive/${sha}.tar.gz"
+          rm -rf /tmp/x && mkdir -p /tmp/x
+          tar xzf /tmp/u.tgz -C /tmp/x
+          src=$(find /tmp/x -maxdepth 1 -type d -name 'muse2api-*' | head -1)
+          test -n "$src" || { echo "source dir not found"; exit 1; }
+          rm -rf upstream && mkdir -p upstream
+          cp -a "$src"/. upstream/
+          rm -rf upstream/.github upstream/.git
+          echo "$sha" > upstream/UPSTREAM-REV.txt
+
+      - name: Commit if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            # -f：上游 .gitignore 可能忽略部分随源码分发的内容，强制纳入保持快照完整
+            git add -A -f
+            git commit -m "chore: sync upstream czg86389-hub/muse2api"
+            git push
+            echo "✅ upstream updated and pushed"
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          else
+            echo "✅ upstream already up to date"
+          fi
