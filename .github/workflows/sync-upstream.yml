@@ -32,6 +32,8 @@ jobs:
           cp -a "$src"/. upstream/
           rm -rf upstream/.github upstream/.git
           echo "$sha" > upstream/UPSTREAM-REV.txt
+          echo "$sha" > upstream/tools/installed_sha
+          sed -i 's|version.json ./|version.json UPSTREAM-REV.tx[t] ./|' upstream/Dockerfile
 
       - name: Commit if changed
         env:
