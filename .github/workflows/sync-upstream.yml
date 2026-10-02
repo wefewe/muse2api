@@ -18,12 +18,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Fetch latest upstream (main)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          sha=$(curl -sSL https://api.github.com/repos/czg86389-hub/muse2api/commits/main \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['sha'])")
+          auth_header="Authorization: Bearer $GH_TOKEN"
+          sha=$(curl -sSL -H "$auth_header" https://api.github.com/repos/czg86389-hub/muse2api/commits/main \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);sys.exit(f'GitHub API error: {d}') if 'sha' not in d else print(d['sha'])")
           echo "upstream sha: $sha"
-          curl -sSL -o /tmp/u.tgz "https://github.com/czg86389-hub/muse2api/archive/${sha}.tar.gz"
+          curl -sSL -H "$auth_header" -o /tmp/u.tgz "https://github.com/czg86389-hub/muse2api/archive/${sha}.tar.gz"
           rm -rf /tmp/x && mkdir -p /tmp/x
           tar xzf /tmp/u.tgz -C /tmp/x
           src=$(find /tmp/x -maxdepth 1 -type d -name 'muse2api-*' | head -1)
