@@ -872,8 +872,19 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None, deadline=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
+    preferred_id = getattr(engine, "current_acc_id", None)
+    if kind == "video" and not account_id:
+        # Prefer the last account that completed a video; session health alone is insufficient.
+        recent = sorted(list(store.tasks.values()), key=lambda task: task.get("created_at", 0), reverse=True)
+        for task in recent:
+            if task.get("kind") != "video" or task.get("status") != "completed" or not task.get("account"):
+                continue
+            candidate = store.get_account(task["account"])
+            if candidate and candidate.get("enabled", True) and candidate.get("ok") is not False:
+                preferred_id = candidate["id"]
+                break
     acc = ACCOUNT_POOL.acquire(account_id=account_id,
-                               preferred_id=getattr(engine, "current_acc_id", None),
+                               preferred_id=preferred_id,
                                timeout=max(1, remaining_wait))
     cur_acc = acc
     last_exc = None
@@ -2045,12 +2056,11 @@ def _warmup_browser_sync():
     """后台静默预热浏览器与首个可用账号的 WebSocket 隧道，使重启后首条请求也秒回。"""
     if getattr(engine, "current_acc_id", None) and engine.page is not None:
         return
-    acc = store.pick_account(rotate=False)
-    if not acc or not acc.get("cookies"):
-        return
     if not GEN_LOCK.acquire(blocking=False):
         return
+    acc = None
     try:
+        acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1)
         log.info("【浏览器预热】正在后台预热账号 %s (%s) 的热备标签页...", acc.get("label"), acc["id"])
         refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
         engine.start()
@@ -2059,6 +2069,10 @@ def _warmup_browser_sync():
     except Exception as exc:  # noqa: BLE001
         log.warning("【浏览器预热】预热异常: %s", exc)
     finally:
+        # Warmup runs in a worker thread; do not retain its account reservation or page.
+        engine.close_current_page()
+        if acc:
+            ACCOUNT_POOL.release(acc["id"])
         GEN_LOCK.release()
 
 

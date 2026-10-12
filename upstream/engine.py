@@ -359,13 +359,15 @@ class MuseEngine:
                     if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
                     var b = document.body ? (document.body.innerText || '') : '';
                     if (b.indexOf('Connecting...') !== -1) return 'connecting';
+                    // Empty composers may not render Send until text has been entered.
+                    if (document.querySelector('textarea').disabled) return 'input-disabled';
                     return 'ready';
                 })()""")
                 if st == "ready":
                     return True
             except Exception:
                 pass
-            time.sleep(0.08)
+            time.sleep(0.1)
         return False
 
     def reset_thread(self, for_chat: bool = False):
@@ -413,7 +415,7 @@ class MuseEngine:
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
             try:
-                if self.page.js("!!document.querySelector('textarea')"):
+                if self.page.js("!!document.querySelector('textarea')") and self._wait_ws_ready(self.page, timeout=8.0):
                     return self.page
             except Exception:
                 pass
@@ -441,30 +443,18 @@ class MuseEngine:
         page = self._open_page()
         self._apply_cookies(page, cookies, expires)
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-        for _ in range(self.cfg.login_wait * 2):
-            time.sleep(0.15)
-            try:
-                if page.js("!!document.querySelector('textarea')"):
-                    self.page = page
-                    self.current_acc_id = account_id
-                    self._wait_ws_ready(page, timeout=15.0)
-                    return page
-            except Exception:
-                pass
+        self.page = page  # Cleanup must also own pages that never become ready.
+        if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
+            self.current_acc_id = account_id
+            return page
         try:
-            if page.js("!!document.querySelector('textarea')"):
-                self.page = page
-                self.current_acc_id = account_id
-                self._wait_ws_ready(page, timeout=15.0)
-                return page
-        except Exception:  # noqa: BLE001
-            pass
-        # 区分「会话失效（被踢回登录页）」和「页面加载卡住」，错误提示才能对症
-        try:
-            body = (page.js("document.body.innerText.slice(0,1200)") or "").lower()
-        except Exception:  # noqa: BLE001
+            body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
+        except Exception:
             body = ""
         self._close_page()
+        if "connecting..." in body:
+            raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
+        # Distinguish an expired session from a page that never became ready.
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
@@ -805,6 +795,10 @@ class MuseEngine:
                     on_progress(prog)
                 except Exception:
                     pass
+            cur_cnt = base_agent_cnt
+            cur_txt = ""
+            has_stop = False
+            tail = ""
             try:
                 st_raw = self.page.js("""(function(){
                     var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
@@ -822,9 +816,10 @@ class MuseEngine:
             tail = st.get("tail") or ""
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
                 raise MuseGenerationError("账号额度不足")
-            # Sidebar/stale connection text does not prove this generation failed.
-            # The caller's generation deadline remains the bounded timeout.
-            # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），且并非正在生成媒体的报告
+            # A Stop button is also shown for messages never acknowledged by the gateway.
+            if elapsed > 30.0 and cur_cnt == base_agent_cnt and re.search(
+                    r"Still sending|Delivery not confirmed|正在发送|未确认送达", tail):
+                raise MuseGenerationError("提示词未成功送达后端（Still sending / Delivery not confirmed），终止等待并重试")
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
@@ -1203,6 +1198,7 @@ class MuseEngine:
                  timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
                  on_progress=None, reference_image: str | None = None,
                  stop_event=None) -> dict:
+        deadline = time.monotonic() + timeout
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
@@ -1215,10 +1211,12 @@ class MuseEngine:
         base = atts_before[-1] if atts_before else {}
         baseline_src = base.get("src") or ""
         base_agent_cnt = self._agent_count()
+        if time.monotonic() >= deadline:
+            raise MuseGenerationError("任务准备超时，已停止发送")
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成")
         att = self._wait_attachment(
-            baseline_src, timeout, expect, on_progress=on_progress,
+            baseline_src, max(0, deadline - time.monotonic()), expect, on_progress=on_progress,
             base_agent_cnt=base_agent_cnt, base_att_cnt=len(atts_before),
             stop_event=stop_event, baseline_sources=baseline_sources
         )
