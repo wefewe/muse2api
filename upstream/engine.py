@@ -271,6 +271,7 @@ class MuseEngine:
         vm_id = sj.get("vm_id")
         vm_state = sj.get("vm_state")
         wake_ok = False
+        wake_requested = False
         if wake_vm and vm_id and vm_state != "DISABLED":
             try:
                 headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
@@ -279,7 +280,16 @@ class MuseEngine:
                     "retry_count": 0,
                     "connect_attempt_id": str(uuid.uuid4()),
                 }, timeout=8)
-                wake_ok = rw.status_code == 200
+                wake_requested = rw.status_code == 200
+                if wake_requested:
+                    # HTTP 200 acknowledges the request; only session state confirms the VM woke.
+                    verify = requests.get("https://muse.ai/api/session", headers=headers,
+                                          timeout=12, allow_redirects=False)
+                    if verify.status_code == 200:
+                        verified_session = verify.json()
+                        if isinstance(verified_session, dict) and verified_session.get("status") == "assigned":
+                            vm_state = verified_session.get("vm_state") or vm_state
+                            wake_ok = vm_state == "RUNNING"
             except Exception:
                 pass
         return {
@@ -288,6 +298,7 @@ class MuseEngine:
             "vm_id": vm_id,
             "vm_state": vm_state,
             "wake_ok": wake_ok,
+            "wake_requested": wake_requested,
             "cookies": cur_cookies,
             "cookies_exp": cur_exp,
         }
@@ -489,9 +500,10 @@ class MuseEngine:
         "return JSON.stringify({x:Math.round(r.x+r.width/2),"
         "y:Math.round(r.y+r.height/2)});})()")
 
-    def quota(self, cookies: dict, expires: dict | None = None) -> dict:
+    def quota(self, cookies: dict, expires: dict | None = None,
+              account_id: str | None = None) -> dict:
         """打开 Settings 面板读额度。返回结构化 dict；读不到时 raise。"""
-        self.ensure_page(cookies, expires)
+        self.ensure_page(cookies, expires, account_id=account_id)
         p = self.page
         time.sleep(1)
 

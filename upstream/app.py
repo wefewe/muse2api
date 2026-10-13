@@ -129,7 +129,7 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0) -> dict:
+                timeout: float = 60.0, record_use: bool = True) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
@@ -150,7 +150,8 @@ class AccountPoolManager:
                         preferred_id=pref,
                         rotate=rotate,
                         force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts
+                        exclude_ids=self.busy_accounts,
+                        record_use=record_use,
                     )
                     if acc:
                         self.busy_accounts.add(acc["id"])
@@ -1648,16 +1649,22 @@ async def test_account(aid: str, _=Depends(auth)):
                 engine.refresh(acc["cookies"], acc.get("cookies_exp"))
                 synced = _sync_cookies(aid)
                 quota = None
-                try:  # 顺带刷新额度；读不到不影响测试结论
+                quota_error = None
+                try:  # Session validity and quota readability are independent results.
                     quota = engine.quota(acc["cookies"],
-                                         acc.get("cookies_exp"))
-                    quota["checked_at"] = int(time.time())
-                    store.update_account(aid, quota=quota)
-                except Exception:  # noqa: BLE001
-                    quota = None
-                store.mark(aid, True, "会话有效")
+                                         acc.get("cookies_exp"), account_id=aid)
+                    if quota.get("found"):
+                        quota["checked_at"] = int(time.time())
+                        store.update_account(aid, quota=quota)
+                    else:
+                        quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
+                        quota = None
+                except Exception as exc:  # noqa: BLE001
+                    quota_error = f"{type(exc).__name__}；额度缓存未更新"
+                store.mark(aid, True, "会话有效" + ("；额度读取失败" if quota_error else ""))
                 return {"ok": True, "message": "会话有效，可正常生成",
-                        "synced": synced, "quota": quota}
+                        "synced": synced, "quota": quota,
+                        "quota_error": quota_error}
             except MuseAuthError as exc:
                 store.mark(aid, False, str(exc)[:200])
                 return {"ok": False, "message": str(exc)[:200]}
@@ -1729,7 +1736,9 @@ async def query_quota(aid: str, _=Depends(auth)):
     def _probe():
         with GEN_LOCK:
             engine.start()
-            q = engine.quota(acc["cookies"], acc.get("cookies_exp"))
+            q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            if not q.get("found"):
+                raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
             q["checked_at"] = int(time.time())
             store.update_account(aid, quota=q)
             return q
@@ -1977,7 +1986,10 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
         if check_quota and GEN_LOCK.acquire(blocking=False):
             try:
                 engine.start()
-                quota = engine.quota(res["cookies"], res["cookies_exp"])
+                quota = engine.quota(res["cookies"], res["cookies_exp"],
+                                     account_id=aid)
+                if not quota.get("found"):
+                    raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
                 quota["checked_at"] = int(time.time())
                 store.update_account(aid, quota=quota)
             except Exception as qe:  # noqa: BLE001
@@ -2023,10 +2035,10 @@ async def run_keepalive_all(force: bool = False) -> dict:
 
                 needs_run = (
                     force
-                    or not exp_at
-                    or (exp_at - now < 36 * 3600)
-                    or ((now - last_ka) > 15 * 60)
-                    or (a.get("ok") is not True)
+                    or not last_ka
+                    or ((now - last_ka) > 6 * 3600 and
+                        (not exp_at or exp_at - now < 36 * 3600 or
+                         a.get("ok") is not True))
                 )
                 if not needs_run:
                     skipped.append({"id": aid, "label": label, "reason": "会话充足且近期已保活"})
@@ -2060,7 +2072,7 @@ def _warmup_browser_sync():
         return
     acc = None
     try:
-        acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1)
+        acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1, record_use=False)
         log.info("【浏览器预热】正在后台预热账号 %s (%s) 的热备标签页...", acc.get("label"), acc["id"])
         refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
         engine.start()
@@ -2087,8 +2099,6 @@ async def _keepalive_loop():
     while True:
         try:
             await run_keepalive_all(force=False)
-            if not getattr(engine, "current_acc_id", None) or engine.page is None:
-                await asyncio.to_thread(_warmup_browser_sync)
         except Exception as e:  # noqa: BLE001
             log.error("【自动保活守护进程】轮询异常: %s", e)
         await asyncio.sleep(900)

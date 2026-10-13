@@ -52,7 +52,7 @@ def test_account_pool_manager():
     dummy_store = SimpleNamespace(
         accounts=dummy_accounts,
         get_account=lambda aid: next((a for a in dummy_accounts if a["id"] == aid), None),
-        pick_account=lambda preferred_id=None, rotate=True, force_rotate=False, exclude_ids=None: next(
+        pick_account=lambda preferred_id=None, rotate=True, force_rotate=False, exclude_ids=None, record_use=True: next(
             (a for a in dummy_accounts if a["id"] not in (exclude_ids or set())), None
         )
     )
